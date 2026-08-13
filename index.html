@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>محطة الاستراتيجية</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  :root {
+    --bg: #0B0D0E; --surface: #14171A; --surface-2: #1C2023;
+    --amber: #E8A33D; --rule: #262A2D; --gain: #3FBF7F; --loss: #E5484D;
+    --text: #ECE9E4; --text-dim: #8A8F93;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); }
+  body { font-family: 'IBM Plex Sans Arabic', system-ui, -apple-system, 'Segoe UI', Tahoma, sans-serif; color: var(--text); }
+  .num { font-family: 'IBM Plex Mono', ui-monospace, 'SF Mono', Consolas, monospace; direction: ltr; unicode-bidi: plaintext; font-variant-numeric: tabular-nums; }
+  input[type=number] { direction: ltr; text-align: left; font-family: inherit; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  .upload-label:focus-within { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .btn-outline, .btn-primary { transition: border-color 150ms, filter 150ms, opacity 150ms; }
+  .btn-outline:hover { border-color: var(--amber); }
+  .btn-primary:hover { filter: brightness(1.08); }
+  ::-webkit-scrollbar { height: 6px; width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 3px; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState } = React;
+
+/* ============================================================
+   منطق الاستراتيجية (مُختبَر مسبقًا عبر Node — نفس النتائج هنا)
+   ============================================================ */
+
+function calcIndicators(candles, emaPeriod = 200, rsiPeriod = 14, atrPeriod = 14) {
+  const n = candles.length;
+  const out = candles.map((c) => ({ ...c }));
+
+  const k = 2 / (emaPeriod + 1);
+  out[0].ema = out[0].close;
+  for (let i = 1; i < n; i++) out[i].ema = out[i].close * k + out[i - 1].ema * (1 - k);
+
+  const alphaR = 1 / rsiPeriod;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 0; i < n; i++) {
+    const delta = i === 0 ? 0 : out[i].close - out[i - 1].close;
+    const gain = Math.max(delta, 0), loss = Math.max(-delta, 0);
+    if (i === 0) { avgGain = gain; avgLoss = loss; }
+    else { avgGain = alphaR * gain + (1 - alphaR) * avgGain; avgLoss = alphaR * loss + (1 - alphaR) * avgLoss; }
+    if (i < rsiPeriod) { out[i].rsi = 50; continue; }
+    if (avgLoss === 0) out[i].rsi = avgGain === 0 ? 50 : 100;
+    else { const rs = avgGain / avgLoss; out[i].rsi = 100 - 100 / (1 + rs); }
+  }
+
+  const alphaA = 1 / atrPeriod;
+  let atrPrev = null;
+  const atrArr = [];
+  for (let i = 0; i < n; i++) {
+    const c = out[i], p = i > 0 ? out[i - 1] : null;
+    const tr = p ? Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)) : c.high - c.low;
+    if (i === 0) atrPrev = tr; else atrPrev = alphaA * tr + (1 - alphaA) * atrPrev;
+    out[i].atr = i < atrPeriod - 1 ? NaN : atrPrev;
+    atrArr.push(out[i].atr);
+  }
+  for (let i = 0; i < n; i++) {
+    const window = atrArr.slice(Math.max(0, i - 49), i + 1).filter((v) => !Number.isNaN(v));
+    out[i].atrAvg50 = window.length >= 10 ? window.reduce((a, b) => a + b, 0) / window.length : NaN;
+  }
+
+  return out;
+}
+
+const bodyOf = (c) => Math.abs(c.close - c.open);
+const rangeOf = (c) => c.high - c.low;
+
+const isStrongBody = (c, minPct = 0.6) => { const r = rangeOf(c); return r > 0 && bodyOf(c) / r >= minPct; };
+
+const isBullishEngulfing = (prev, curr, minRatio = 1.3) => {
+  const prevBear = prev.close < prev.open, currBull = curr.close > curr.open;
+  const engulfs = curr.open <= prev.close && curr.close >= prev.open;
+  const sizeOk = bodyOf(prev) > 0 && bodyOf(curr) >= minRatio * bodyOf(prev);
+  return prevBear && currBull && engulfs && sizeOk;
+};
+
+const isBearishEngulfing = (prev, curr, minRatio = 1.3) => {
+  const prevBull = prev.close > prev.open, currBear = curr.close < curr.open;
+  const engulfs = curr.open >= prev.close && curr.close <= prev.open;
+  const sizeOk = bodyOf(prev) > 0 && bodyOf(curr) >= minRatio * bodyOf(prev);
+  return prevBull && currBear && engulfs && sizeOk;
+};
+
+const isHammer = (c, wickRatio = 2.0, oppMax = 0.3) => {
+  const b = bodyOf(c); if (b === 0) return false;
+  const lower = Math.min(c.open, c.close) - c.low, upper = c.high - Math.max(c.open, c.close);
+  return lower >= wickRatio * b && upper <= oppMax * b;
+};
+
+const isShootingStar = (c, wickRatio = 2.0, oppMax = 0.3) => {
+  const b = bodyOf(c); if (b === 0) return false;
+  const upper = c.high - Math.max(c.open, c.close), lower = Math.min(c.open, c.close) - c.low;
+  return upper >= wickRatio * b && lower <= oppMax * b;
+};
+
+function findZones(candles, direction, baseMax = 3, baseBodyPct = 0.3, impulseAtrMult = 1.5) {
+  const zones = [];
+  for (let i = baseMax + 1; i < candles.length; i++) {
+    const impulse = candles[i];
+    if (Number.isNaN(impulse.atr)) continue;
+    const isImpulse = direction === 'demand' ? impulse.close > impulse.open : impulse.close < impulse.open;
+    if (!isImpulse || bodyOf(impulse) < impulseAtrMult * impulse.atr) continue;
+
+    const baseEnd = i - 1;
+    let baseStart = baseEnd;
+    for (let j = baseEnd; j >= Math.max(baseEnd - baseMax, 0); j--) {
+      const c = candles[j], r = rangeOf(c);
+      if (r > 0 && bodyOf(c) / r <= baseBodyPct) baseStart = j; else break;
+    }
+    const baseCandle = candles[baseEnd], rng = rangeOf(baseCandle);
+    if (rng === 0 || bodyOf(baseCandle) / rng > baseBodyPct) continue;
+
+    let zoneLow = Infinity, zoneHigh = -Infinity;
+    for (let j = baseStart; j <= baseEnd; j++) { zoneLow = Math.min(zoneLow, candles[j].low); zoneHigh = Math.max(zoneHigh, candles[j].high); }
+    zones.push({ type: direction, endIdx: baseEnd, zoneLow, zoneHigh });
+  }
+  return zones;
+}
+
+const atrFilterOk = (c, min = 0.75, max = 2.0) => {
+  if (Number.isNaN(c.atrAvg50) || c.atrAvg50 === 0) return false;
+  const ratio = c.atr / c.atrAvg50;
+  return ratio >= min && ratio <= max;
+};
+
+function generateSignal(candles, i, demandZones, supplyZones, opts = {}) {
+  const { rsiBullMin = 50, rsiBearMax = 50, atrMin = 0.75, atrMax = 2.0 } = opts;
+  if (i < 1 || Number.isNaN(candles[i].ema)) return null;
+  const row = candles[i], prev = candles[i - 1];
+  if (!atrFilterOk(row, atrMin, atrMax)) return null;
+
+  if (row.close > row.ema) {
+    const zone = demandZones.find((z) => z.endIdx < i && row.low >= z.zoneLow && row.low <= z.zoneHigh);
+    if (zone) {
+      const patternOk = isStrongBody(row) && (isBullishEngulfing(prev, row) || isHammer(row));
+      const rsiOk = row.rsi > rsiBullMin || row.rsi > prev.rsi;
+      if (patternOk && rsiOk) return 'CALL';
+    }
+  }
+  if (row.close < row.ema) {
+    const zone = supplyZones.find((z) => z.endIdx < i && row.high >= z.zoneLow && row.high <= z.zoneHigh);
+    if (zone) {
+      const patternOk = isStrongBody(row) && (isBearishEngulfing(prev, row) || isShootingStar(row));
+      const rsiOk = row.rsi < rsiBearMax || row.rsi < prev.rsi;
+      if (patternOk && rsiOk) return 'PUT';
+    }
+  }
+  return null;
+}
+
+function runBacktest(rawCandles, params) {
+  const { capital: startCapital = 1000, riskPct = 1.5, maxDailyLosses = 3, payoutPct = 85,
+    tradeDuration = 3, atrMin = 0.75, atrMax = 2.0, emaPeriod = 200, rsiPeriod = 14, atrPeriod = 14 } = params;
+  const candles = calcIndicators(rawCandles, emaPeriod, rsiPeriod, atrPeriod);
+  const demandZones = findZones(candles, 'demand');
+  const supplyZones = findZones(candles, 'supply');
+
+  let capital = startCapital, dailyLosses = 0, currentDay = null;
+  const trades = [];
+  const start = Math.max(200, emaPeriod);
+
+  for (let i = start; i < candles.length - tradeDuration - 1; i++) {
+    const row = candles[i];
+    const day = new Date(row.time).toDateString();
+    if (day !== currentDay) { currentDay = day; dailyLosses = 0; }
+    if (dailyLosses >= maxDailyLosses) continue;
+
+    const side = generateSignal(candles, i, demandZones, supplyZones, { atrMin, atrMax });
+    if (!side) continue;
+
+    const entry = candles[i + 1].open;
+    const exit = candles[i + 1 + tradeDuration].close;
+    const won = side === 'CALL' ? exit > entry : exit < entry;
+    const stake = capital * (riskPct / 100);
+    const pnl = won ? stake * (payoutPct / 100) : -stake;
+    capital += pnl;
+    if (!won) dailyLosses++;
+
+    trades.push({ time: row.time, side, entry, exit, won, pnl, capitalAfter: capital });
+  }
+
+  const wins = trades.filter((t) => t.won).length;
+  return {
+    trades, finalCapital: capital, startCapital,
+    winRate: trades.length ? (wins / trades.length) * 100 : 0,
+    netPnl: capital - startCapital,
+  };
+}
+
+function generateSampleData(n = 3000, seed = 42) {
+  let s = seed;
+  const rand = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+  const gauss = (std = 1) => {
+    let u = 0, v = 0;
+    while (u === 0) u = rand();
+    while (v === 0) v = rand();
+    return std * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+
+  const candles = [];
+  let close = 100;
+  const start = new Date('2026-01-01T00:00:00Z').getTime();
+  for (let i = 0; i < n; i++) {
+    let step = gauss(0.04);
+    if (rand() < 0.05) step *= 5 + rand() * 5;
+    const open = close;
+    close = open + step;
+    const wu = Math.abs(gauss(0.025)), wd = Math.abs(gauss(0.025));
+    const high = Math.max(open, close) + wu, low = Math.min(open, close) - wd;
+    candles.push({ time: start + i * 5 * 60 * 1000, open, high, low, close });
+  }
+  return candles;
+}
+
+/* ============================================================
+   أيقونات SVG بسيطة (بدل مكتبة خارجية)
+   ============================================================ */
+
+const ICONS = {
+  upload: "M12 3v12m0-12l-4 4m4-4l4 4M4 17v3a1 1 0 001 1h14a1 1 0 001-1v-3",
+  refresh: "M21 12a9 9 0 10-2.6 6.4M21 12v-5m0 5h-5",
+  up: "M3 17l6-6 4 4 8-8M15 7h6v6",
+  down: "M3 7l6 6 4-4 8 8M15 17h6v-6",
+};
+
+function Icon({ name, size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d={ICONS[name]} />
+    </svg>
+  );
+}
+
+function PlayIcon({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
+      <path d="M6 4l14 8-14 8V4z" />
+    </svg>
+  );
+}
+
+/* ============================================================
+   منحنى رأس المال (SVG مستقل بدون مكتبة رسوم بيانية)
+   ============================================================ */
+
+function EquityChart({ data }) {
+  if (!data || data.length < 2) {
+    return <div className="text-xs" style={{ color: 'var(--text-dim)' }}>لا يوجد عدد كافٍ من النقاط للرسم.</div>;
+  }
+  const w = 300, h = 120, pad = 4;
+  const caps = data.map((d) => d.capital);
+  const min = Math.min(...caps), max = Math.max(...caps);
+  const range = max - min || 1;
+  const pts = data.map((d, idx) => {
+    const x = pad + (idx / (data.length - 1)) * (w - pad * 2);
+    const y = pad + (h - pad * 2) - ((d.capital - min) / range) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ width: '100%', height: 180, display: 'block' }}>
+      {[0, 0.25, 0.5, 0.75, 1].map((p) => (
+        <line key={p} x1={pad} y1={pad + p * (h - pad * 2)} x2={w - pad} y2={pad + p * (h - pad * 2)}
+          style={{ stroke: 'var(--rule)', strokeWidth: 1, strokeDasharray: '2 3' }} />
+      ))}
+      <polyline points={pts} fill="none" style={{ stroke: 'var(--amber)', strokeWidth: 2, vectorEffect: 'non-scaling-stroke' }} />
+    </svg>
+  );
+}
+
+/* ============================================================
+   مكوّنات واجهة صغيرة
+   ============================================================ */
+
+function Num({ value, decimals = 2, sign = false }) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return <span className="num">—</span>;
+  const formatted = n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const s = sign && n > 0 ? `+${formatted}` : formatted;
+  return <span className="num">{s}</span>;
+}
+
+function SectionHeader({ step, title }) {
+  return (
+    <div className="flex items-center gap-2 mb-3">
+      <span className="num text-xs font-semibold" style={{ color: 'var(--amber)' }}>{step}</span>
+      <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-dim)' }}>{title}</span>
+    </div>
+  );
+}
+
+function StatCell({ label, value, color }) {
+  return (
+    <div className="p-3" style={{ background: 'var(--surface)' }}>
+      <div className="text-xs mb-1" style={{ color: 'var(--text-dim)' }}>{label}</div>
+      <div className="text-lg font-semibold" style={{ color: color || 'var(--text)' }}>{value}</div>
+    </div>
+  );
+}
+
+function WinLossBar({ winRate }) {
+  const w = Math.max(0, Math.min(100, winRate));
+  return (
+    <div>
+      <div className="flex overflow-hidden rounded-sm" style={{ height: 8, background: 'var(--rule)' }}>
+        <div style={{ width: `${w}%`, background: 'var(--gain)' }} />
+        <div style={{ width: `${100 - w}%`, background: 'var(--loss)' }} />
+      </div>
+      <div className="flex justify-between text-xs mt-1" style={{ color: 'var(--text-dim)' }}>
+        <span>نجاح <Num value={w} decimals={1} />%</span>
+        <span>خسارة <Num value={100 - w} decimals={1} />%</span>
+      </div>
+    </div>
+  );
+}
+
+function ParamField({ label, value, onChange, step = 1, min, suffix }) {
+  return (
+    <label className="block">
+      <div className="text-xs mb-1" style={{ color: 'var(--text-dim)' }}>{label}</div>
+      <div className="flex items-center" style={{ background: 'var(--surface-2)', border: '1px solid var(--rule)', borderRadius: 4 }}>
+        <input
+          type="number"
+          value={value}
+          step={step}
+          min={min}
+          onChange={onChange}
+          className="num w-full bg-transparent px-2 py-2 text-sm outline-none"
+          style={{ color: 'var(--text)' }}
+        />
+        {suffix && <span className="text-xs px-2" style={{ color: 'var(--text-dim)' }}>{suffix}</span>}
+      </div>
+    </label>
+  );
+}
+
+/* ============================================================
+   التطبيق الرئيسي
+   ============================================================ */
+
+function TradingStrategyApp() {
+  const [candles, setCandles] = useState(null);
+  const [dataLabel, setDataLabel] = useState('');
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+  const [results, setResults] = useState(null);
+
+  const [params, setParams] = useState({
+    capital: 1000, riskPct: 1.5, maxDailyLosses: 3, payoutPct: 85,
+    tradeDuration: 3, atrMinPct: 75, atrMaxPct: 200,
+  });
+
+  const setParam = (key) => (e) => {
+    const v = e.target.value;
+    setParams((p) => ({ ...p, [key]: v === '' ? '' : Number(v) }));
+  };
+
+  const loadCandles = (arr, label) => {
+    setCandles(arr);
+    setDataLabel(label);
+    setResults(null);
+    setError('');
+  };
+
+  const handleSample = () => {
+    const data = generateSampleData(3000);
+    loadCandles(data, 'بيانات تجريبية عشوائية');
+    setNotice('هذه بيانات عشوائية لتجربة الأداة فقط — ليست بيانات سوق حقيقية.');
+  };
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setNotice('');
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = Papa.parse(String(reader.result), { header: true, dynamicTyping: true, skipEmptyLines: true });
+        const fields = (parsed.meta.fields || []).map((f) => f.toLowerCase().trim());
+        const find = (names) => {
+          for (const nm of names) {
+            const idx = fields.indexOf(nm);
+            if (idx !== -1) return parsed.meta.fields[idx];
+          }
+          return null;
+        };
+        const openKey = find(['open', 'o']);
+        const highKey = find(['high', 'h']);
+        const lowKey = find(['low', 'l']);
+        const closeKey = find(['close', 'c']);
+        const timeKey = find(['time', 'date', 'datetime', 'timestamp']);
+
+        if (!openKey || !highKey || !lowKey || !closeKey) {
+          setError('لم أجد أعمدة open/high/low/close في الملف. تأكد أن السطر الأول يحتوي أسماء الأعمدة.');
+          return;
+        }
+
+        let rows = parsed.data
+          .filter((r) => r[openKey] != null && r[highKey] != null && r[lowKey] != null && r[closeKey] != null)
+          .map((r) => {
+            let t = NaN;
+            if (timeKey) {
+              const raw = r[timeKey];
+              if (typeof raw === 'number') t = raw < 1e11 ? raw * 1000 : raw;
+              else t = Date.parse(raw);
+            }
+            return { time: t, open: Number(r[openKey]), high: Number(r[highKey]), low: Number(r[lowKey]), close: Number(r[closeKey]) };
+          });
+
+        const badTimes = rows.filter((r) => Number.isNaN(r.time)).length;
+        if (!timeKey || badTimes > rows.length * 0.2) {
+          const base = Date.now();
+          rows = rows.map((r, i) => ({ ...r, time: base + i * 60000 }));
+          setNotice('لم يتم التعرف على عمود وقت صالح — تم استخدام ترتيب الصفوف كتسلسل زمني تقريبي.');
+        } else {
+          rows.sort((a, b) => a.time - b.time);
+        }
+
+        if (rows.length < 250) {
+          setError(`الملف يحتوي ${rows.length} شمعة فقط — يحتاج المؤشر EMA200 على الأقل 250 شمعة لنتائج ذات معنى.`);
+          return;
+        }
+
+        loadCandles(rows, file.name);
+      } catch (err) {
+        setError('تعذّرت قراءة الملف. تأكد أنه CSV صالح بأعمدة open, high, low, close.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleRun = () => {
+    if (!candles) return;
+    setIsRunning(true);
+    setTimeout(() => {
+      const p = {
+        capital: params.capital || 1000,
+        riskPct: params.riskPct || 1.5,
+        maxDailyLosses: params.maxDailyLosses || 3,
+        payoutPct: params.payoutPct || 85,
+        tradeDuration: Math.max(1, params.tradeDuration || 3),
+        atrMin: (params.atrMinPct || 75) / 100,
+        atrMax: (params.atrMaxPct || 200) / 100,
+        emaPeriod: 200, rsiPeriod: 14, atrPeriod: 14,
+      };
+      const res = runBacktest(candles, p);
+      setResults(res);
+      setIsRunning(false);
+    }, 50);
+  };
+
+  const equityData = results
+    ? [{ i: 0, capital: results.startCapital }, ...results.trades.map((t, i) => ({ i: i + 1, capital: t.capitalAfter }))]
+    : [];
+
+  const maxDrawdownPct = (() => {
+    if (!results || !results.trades.length) return 0;
+    let peak = results.startCapital, maxDd = 0;
+    for (const t of results.trades) {
+      peak = Math.max(peak, t.capitalAfter);
+      maxDd = Math.max(maxDd, (peak - t.capitalAfter) / peak);
+    }
+    return maxDd * 100;
+  })();
+
+  return (
+    <div dir="rtl" className="min-h-screen w-full" style={{ background: 'var(--bg)', color: 'var(--text)' }}>
+      <div className="max-w-md mx-auto px-4 pb-16">
+        <div className="pt-6 pb-4 border-b" style={{ borderColor: 'var(--rule)' }}>
+          <div className="text-xs uppercase tracking-widest" style={{ color: 'var(--amber)' }}>أداة اختبار استراتيجية</div>
+          <h1 className="text-2xl font-bold mt-1">محطة الاستراتيجية</h1>
+          <div className="flex items-center gap-2 mt-2 text-sm" style={{ color: 'var(--text-dim)' }}>
+            <span className="inline-block rounded-full" style={{ width: 8, height: 8, background: candles ? 'var(--gain)' : 'var(--text-dim)' }} />
+            <span>{candles ? `${dataLabel} — ${candles.length.toLocaleString('en-US')} شمعة` : 'لا توجد بيانات محمّلة'}</span>
+          </div>
+        </div>
+
+        <div className="py-5 border-b" style={{ borderColor: 'var(--rule)' }}>
+          <SectionHeader step="01" title="البيانات" />
+          <div className="flex gap-2">
+            <label htmlFor="csv-upload" className="upload-label btn-outline flex-1 flex items-center justify-center gap-2 py-3 text-sm cursor-pointer" style={{ background: 'var(--surface)', border: '1px solid var(--rule)', borderRadius: 4 }}>
+              <Icon name="upload" size={16} color="var(--amber)" />
+              رفع CSV
+              <input id="csv-upload" type="file" accept=".csv" className="visually-hidden" onChange={handleFile} />
+            </label>
+            <button onClick={handleSample} className="btn-outline flex-1 flex items-center justify-center gap-2 py-3 text-sm" style={{ background: 'var(--surface)', border: '1px solid var(--rule)', borderRadius: 4, color: 'var(--text)' }}>
+              <Icon name="refresh" size={16} color="var(--amber)" />
+              بيانات تجريبية
+            </button>
+          </div>
+          {notice && <div className="text-xs mt-2" style={{ color: 'var(--amber)' }}>{notice}</div>}
+          {error && <div className="text-xs mt-2" style={{ color: 'var(--loss)' }}>{error}</div>}
+          <div className="text-xs mt-2" style={{ color: 'var(--text-dim)' }}>
+            الأعمدة المطلوبة في CSV: open, high, low, close (وعمود وقت اختياري: time/date).
+          </div>
+        </div>
+
+        <div className="py-5 border-b" style={{ borderColor: 'var(--rule)' }}>
+          <SectionHeader step="02" title="الإعدادات" />
+          <div className="grid grid-cols-2 gap-3">
+            <ParamField label="رأس المال" value={params.capital} onChange={setParam('capital')} step={100} min={0} suffix="$" />
+            <ParamField label="المخاطرة لكل صفقة" value={params.riskPct} onChange={setParam('riskPct')} step={0.1} min={0.1} suffix="%" />
+            <ParamField label="حد الخسائر اليومي" value={params.maxDailyLosses} onChange={setParam('maxDailyLosses')} step={1} min={1} />
+            <ParamField label="نسبة العائد عند الربح" value={params.payoutPct} onChange={setParam('payoutPct')} step={1} min={1} suffix="%" />
+            <ParamField label="مدة الصفقة (شموع)" value={params.tradeDuration} onChange={setParam('tradeDuration')} step={1} min={1} />
+            <ParamField label="أدنى ATR" value={params.atrMinPct} onChange={setParam('atrMinPct')} step={5} min={0} suffix="%" />
+            <ParamField label="أعلى ATR" value={params.atrMaxPct} onChange={setParam('atrMaxPct')} step={5} min={0} suffix="%" />
+          </div>
+          <div className="text-xs mt-3" style={{ color: 'var(--text-dim)' }}>
+            ثابتة حسب الاستراتيجية الأصلية: EMA <Num value={200} decimals={0} /> · RSI <Num value={14} decimals={0} /> · ATR <Num value={14} decimals={0} />
+          </div>
+        </div>
+
+        <div className="py-5 border-b" style={{ borderColor: 'var(--rule)' }}>
+          <button
+            onClick={handleRun}
+            disabled={!candles || isRunning}
+            className="btn-primary w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold"
+            style={{
+              background: !candles ? 'var(--surface-2)' : 'var(--amber)',
+              color: !candles ? 'var(--text-dim)' : '#171308',
+              borderRadius: 4,
+              opacity: isRunning ? 0.7 : 1,
+              cursor: !candles ? 'not-allowed' : 'pointer',
+            }}
+          >
+            <PlayIcon size={16} />
+            {isRunning ? 'جاري التشغيل...' : 'شغّل الاختبار'}
+          </button>
+        </div>
+
+        <div className="py-5">
+          <SectionHeader step="03" title="النتائج" />
+
+          {!results && (
+            <div className="text-sm py-8 text-center" style={{ color: 'var(--text-dim)', border: '1px dashed var(--rule)', borderRadius: 4 }}>
+              لا نتائج بعد. حمّل بيانات واضغط «شغّل الاختبار».
+            </div>
+          )}
+
+          {results && results.trades.length === 0 && (
+            <div className="text-sm py-6 text-center" style={{ color: 'var(--text-dim)', border: '1px dashed var(--rule)', borderRadius: 4 }}>
+              لم يجد الاختبار أي صفقة مطابقة على هذه البيانات. جرّب توسيع نطاق ATR أو استخدام بيانات أطول.
+            </div>
+          )}
+
+          {results && results.trades.length > 0 && (
+            <>
+              <div className="grid grid-cols-2 gap-px mb-4" style={{ background: 'var(--rule)' }}>
+                <StatCell label="عدد الصفقات" value={<Num value={results.trades.length} decimals={0} />} />
+                <StatCell label="نسبة النجاح" value={<><Num value={results.winRate} decimals={1} />%</>} />
+                <StatCell label="صافي الربح/الخسارة" value={<Num value={results.netPnl} decimals={2} sign />} color={results.netPnl >= 0 ? 'var(--gain)' : 'var(--loss)'} />
+                <StatCell label="الرأسمال النهائي" value={<Num value={results.finalCapital} decimals={2} />} />
+              </div>
+
+              <WinLossBar winRate={results.winRate} />
+
+              <div className="mt-5">
+                <div className="text-xs mb-2" style={{ color: 'var(--text-dim)' }}>منحنى رأس المال</div>
+                <div dir="ltr">
+                  <EquityChart data={equityData} />
+                </div>
+                <div className="text-xs mt-1" style={{ color: 'var(--text-dim)' }}>
+                  أقصى تراجع: <span style={{ color: 'var(--loss)' }}>-<Num value={maxDrawdownPct} decimals={1} />%</span>
+                </div>
+              </div>
+
+              <div className="mt-5">
+                <div className="text-xs mb-2" style={{ color: 'var(--text-dim)' }}>سجل الصفقات (الأحدث أولاً)</div>
+                <div className="overflow-y-auto" style={{ maxHeight: 320, border: '1px solid var(--rule)', borderRadius: 4 }}>
+                  {[...results.trades].reverse().map((t, idx) => (
+                    <div key={idx} className="px-3 py-2 flex items-center justify-between" style={{ borderBottom: '1px solid var(--rule)' }}>
+                      <div className="flex items-center gap-2">
+                        <Icon name={t.side === 'CALL' ? 'up' : 'down'} size={14} color="var(--amber)" />
+                        <div>
+                          <div className="text-xs font-medium">{t.side}</div>
+                          <div className="text-xs" style={{ color: 'var(--text-dim)' }}>
+                            <Num value={t.entry} decimals={4} /> ← <Num value={t.exit} decimals={4} />
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-left">
+                        <div className="text-xs font-semibold" style={{ color: t.won ? 'var(--gain)' : 'var(--loss)' }}>
+                          <Num value={t.pnl} decimals={2} sign />
+                        </div>
+                        <div className="text-xs" style={{ color: 'var(--text-dim)' }}>{t.won ? 'ربح' : 'خسارة'}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<TradingStrategyApp />);
+</script>
+</body>
+</html>
